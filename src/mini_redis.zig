@@ -6,7 +6,7 @@
 //! Implements RESP2 (REdis Serialization Protocol) with the following commands:
 //! - PING: Returns PONG
 //! - ECHO <message>: Returns the message
-//! - SET <key> <value>: Stores a key-value pair
+//! - SET <key> <value> [EX seconds|PX milliseconds]: Stores a key-value pair with optional expiration
 //! - GET <key>: Retrieves a value by key
 //! - DEL <key>: Deletes a key
 //! - EXISTS <key>: Checks if a key exists
@@ -115,13 +115,47 @@ const StringRef = struct {
 // Store - Key-Value Storage
 // =============================================================================
 
+/// Entry in the key-value store with optional expiration
+const Entry = struct {
+    value_ref: *StringRef,
+    expires_at_ns: ?i64, // null = no expiration
+};
+
+/// Expiration tracking for a key
+const Expiration = struct {
+    when_ns: i64,
+    key: []const u8, // Reference to key in Store.map (not owned)
+};
+
+fn compareExpirations(context: void, a: Expiration, b: Expiration) std.math.Order {
+    _ = context;
+    // First compare by time (primary sorting key for heap)
+    const time_order = std.math.order(a.when_ns, b.when_ns);
+    if (time_order != .eq) return time_order;
+
+    // If times equal, compare by key pointer for uniqueness
+    // This allows us to uniquely identify and remove specific expiration entries
+    return std.math.order(@intFromPtr(a.key.ptr), @intFromPtr(b.key.ptr));
+}
+
 const Store = struct {
-    map: std.StringHashMapUnmanaged(*StringRef),
+    map: std.StringHashMapUnmanaged(Entry),
+    // NOTE: Using PriorityQueue requires O(n) search to remove specific entries.
+    // Ideally we'd use a balanced tree for O(log n) removal, but there isn't one
+    // in Zig's standard library and we want to keep this simple.
+    expirations: std.PriorityQueue(Expiration, void, compareExpirations),
+
+    // Synchronization for expiration worker
+    mutex: zio.Mutex = zio.Mutex.init,
+    expiration_cond: zio.Condition = zio.Condition.init,
+    shutdown: bool = false,
+
     allocator: std.mem.Allocator,
 
     fn init(allocator: std.mem.Allocator) Store {
         return .{
             .map = .{},
+            .expirations = std.PriorityQueue(Expiration, void, compareExpirations).init(allocator, {}),
             .allocator = allocator,
         };
     }
@@ -129,59 +163,210 @@ const Store = struct {
     fn deinit(self: *Store) void {
         var it = self.map.iterator();
         while (it.next()) |entry| {
-            entry.value_ptr.*.release(self.allocator);
+            entry.value_ptr.*.value_ref.release(self.allocator);
             self.allocator.free(entry.key_ptr.*);
         }
         self.map.deinit(self.allocator);
+
+        // Clean up expiration queue (keys are references, not owned)
+        self.expirations.deinit();
     }
 
-    fn set(self: *Store, key: []const u8, value: []const u8) !void {
+    /// Remove an expiration entry from the queue (O(n) search)
+    fn removeExpiration(self: *Store, target: Expiration) void {
+        var it = self.expirations.iterator();
+        var idx: usize = 0;
+        while (it.next()) |exp| : (idx += 1) {
+            if (compareExpirations({}, exp, target) == .eq) {
+                _ = self.expirations.removeIndex(idx);
+                return;
+            }
+        }
+    }
+
+    fn set(self: *Store, rt: *zio.Runtime, key: []const u8, value: []const u8, expire_ms: ?u32) !void {
+        self.mutex.lock(rt);
+        defer self.mutex.unlock(rt);
+
         // Create new StringRef
         const value_ref = try StringRef.create(self.allocator, value);
         errdefer value_ref.release(self.allocator);
+
+        // Calculate expiration time (u32 * 1,000,000 fits in i64)
+        const expires_at_ns = if (expire_ms) |ms|
+            std.time.nanoTimestamp() + @as(i64, ms) * 1_000_000
+        else
+            null;
 
         // Get or put the key
         const gop = try self.map.getOrPut(self.allocator, key);
         errdefer if (!gop.found_existing) self.map.removeByPtr(gop.key_ptr);
 
         if (gop.found_existing) {
+            // Remove old expiration entry if it exists
+            if (gop.value_ptr.*.expires_at_ns) |old_when_ns| {
+                self.removeExpiration(.{ .when_ns = old_when_ns, .key = gop.key_ptr.* });
+            }
             // Release old value
-            gop.value_ptr.*.release(self.allocator);
+            gop.value_ptr.*.value_ref.release(self.allocator);
         } else {
             // Allocate owned key for new entry
             gop.key_ptr.* = try self.allocator.dupe(u8, key);
         }
 
         // Set new value
-        gop.value_ptr.* = value_ref;
-    }
+        gop.value_ptr.* = .{
+            .value_ref = value_ref,
+            .expires_at_ns = expires_at_ns,
+        };
 
-    fn get(self: *Store, key: []const u8) ?[]const u8 {
-        if (self.map.get(key)) |value_ref| {
-            value_ref.borrow();
-            return value_ref.getData();
+        // Track expiration if specified
+        if (expires_at_ns) |when_ns| {
+            // Check if this is the soonest expiration
+            const should_notify = if (self.expirations.peek()) |next|
+                when_ns < next.when_ns
+            else
+                true;
+
+            // Use reference to key in map (not owned copy)
+            try self.expirations.add(.{
+                .when_ns = when_ns,
+                .key = gop.key_ptr.*,
+            });
+
+            // Wake up expiration worker if this expires sooner
+            if (should_notify) {
+                self.expiration_cond.signal(rt);
+            }
         }
-        return null;
     }
 
-    fn releaseValue(self: *Store, value_data: []const u8) void {
+    fn get(self: *Store, rt: *zio.Runtime, key: []const u8) ?[]const u8 {
+        self.mutex.lock(rt);
+        defer self.mutex.unlock(rt);
+
+        const gop = self.map.getEntry(key) orelse return null;
+
+        // Check if expired (lazy expiration)
+        if (gop.value_ptr.*.expires_at_ns) |expires_at| {
+            if (std.time.nanoTimestamp() >= expires_at) {
+                // Expired - remove from expiration queue and map
+                self.removeExpiration(.{ .when_ns = expires_at, .key = gop.key_ptr.* });
+                gop.value_ptr.*.value_ref.release(self.allocator);
+                self.allocator.free(gop.key_ptr.*);
+                self.map.removeByPtr(gop.key_ptr);
+                return null;
+            }
+        }
+
+        gop.value_ptr.*.value_ref.borrow();
+        return gop.value_ptr.*.value_ref.getData();
+    }
+
+    fn releaseValue(self: *Store, rt: *zio.Runtime, value_data: []const u8) void {
+        self.mutex.lock(rt);
+        defer self.mutex.unlock(rt);
+
         const ref = StringRef.fromData(value_data);
         ref.release(self.allocator);
     }
 
-    fn del(self: *Store, key: []const u8) bool {
-        if (self.map.fetchRemove(key)) |kv| {
-            kv.value.release(self.allocator);
-            self.allocator.free(kv.key);
-            return true;
+    fn del(self: *Store, rt: *zio.Runtime, key: []const u8) bool {
+        self.mutex.lock(rt);
+        defer self.mutex.unlock(rt);
+
+        const gop = self.map.getEntry(key) orelse return false;
+
+        // Check if expired (lazy expiration)
+        if (gop.value_ptr.*.expires_at_ns) |expires_at| {
+            if (std.time.nanoTimestamp() >= expires_at) {
+                // Expired - remove from expiration queue and map, but return false
+                self.removeExpiration(.{ .when_ns = expires_at, .key = gop.key_ptr.* });
+                gop.value_ptr.*.value_ref.release(self.allocator);
+                self.allocator.free(gop.key_ptr.*);
+                self.map.removeByPtr(gop.key_ptr);
+                return false;
+            }
         }
-        return false;
+
+        // Key exists and is not expired - delete it
+        self.removeExpiration(.{ .when_ns = gop.value_ptr.*.expires_at_ns orelse 0, .key = gop.key_ptr.* });
+        gop.value_ptr.*.value_ref.release(self.allocator);
+        self.allocator.free(gop.key_ptr.*);
+        self.map.removeByPtr(gop.key_ptr);
+        return true;
     }
 
-    fn exists(self: *Store, key: []const u8) bool {
-        return self.map.contains(key);
+    fn exists(self: *Store, rt: *zio.Runtime, key: []const u8) bool {
+        self.mutex.lock(rt);
+        defer self.mutex.unlock(rt);
+
+        const gop = self.map.getEntry(key) orelse return false;
+
+        // Check if expired (lazy expiration)
+        if (gop.value_ptr.*.expires_at_ns) |expires_at| {
+            if (std.time.nanoTimestamp() >= expires_at) {
+                // Expired - remove from expiration queue and map
+                self.removeExpiration(.{ .when_ns = expires_at, .key = gop.key_ptr.* });
+                gop.value_ptr.*.value_ref.release(self.allocator);
+                self.allocator.free(gop.key_ptr.*);
+                self.map.removeByPtr(gop.key_ptr);
+                return false;
+            }
+        }
+
+        return true;
     }
 };
+
+// =============================================================================
+// Expiration Worker
+// =============================================================================
+
+/// Background task that purges expired keys
+fn expirationWorker(rt: *zio.Runtime, store: *Store) void {
+    while (true) {
+        store.mutex.lock(rt);
+        defer store.mutex.unlock(rt);
+
+        if (store.shutdown) {
+            break;
+        }
+
+        // Purge all expired keys
+        const now = std.time.nanoTimestamp();
+        while (store.expirations.peek()) |exp| {
+            if (exp.when_ns > now) break; // Not expired yet
+
+            const expired = store.expirations.remove();
+            if (store.map.fetchRemove(expired.key)) |kv| {
+                kv.value.value_ref.release(store.allocator);
+                store.allocator.free(kv.key);
+            }
+            // Note: expired.key is a reference, not owned, so don't free it
+        }
+
+        // Wait for next expiration OR notification
+        if (store.expirations.peek()) |next| {
+            const timeout_ns = next.when_ns - std.time.nanoTimestamp();
+            if (timeout_ns > 0) {
+                // timedWait = tokio::select! equivalent
+                // Returns error.Timeout OR wakes on signal
+                // NOTE: timedWait releases and reacquires mutex internally
+                store.expiration_cond.timedWait(rt, &store.mutex, @intCast(timeout_ns)) catch {
+                    // Timeout - loop back to purge
+                };
+                // If signaled early - loop back to check new expiration
+            }
+        } else {
+            // No expirations - wait indefinitely for notification
+            // NOTE: wait releases and reacquires mutex internally
+            store.expiration_cond.wait(rt, &store.mutex);
+        }
+    }
+
+    std.log.debug("Expiration worker shut down", .{});
+}
 
 // =============================================================================
 // RESP2 Protocol Parser
@@ -302,6 +487,7 @@ const RespWriter = struct {
 
 const CommandHandler = struct {
     store: *Store,
+    runtime: *zio.Runtime,
 
     fn execute(self: *CommandHandler, cmd: *Command, resp: *RespWriter) !void {
         if (cmd.args.len == 0) return error.EmptyCommand;
@@ -349,10 +535,32 @@ const CommandHandler = struct {
     }
 
     fn handleSet(self: *CommandHandler, cmd: *Command, resp: *RespWriter) !void {
-        if (cmd.args.len != 3) {
+        if (cmd.args.len < 3) {
             return resp.writeError("ERR wrong number of arguments for 'set' command");
         }
-        try self.store.set(cmd.args[1], cmd.args[2]);
+
+        var expire_ms: ?u32 = null;
+
+        // Parse optional expiration: SET key value [EX seconds|PX milliseconds]
+        if (cmd.args.len >= 5) {
+            const option = cmd.args[3];
+            if (std.ascii.eqlIgnoreCase(option, "EX")) {
+                const seconds = std.fmt.parseInt(u32, cmd.args[4], 10) catch {
+                    return resp.writeError("ERR invalid expire time in 'set' command");
+                };
+                expire_ms = seconds * 1000;
+            } else if (std.ascii.eqlIgnoreCase(option, "PX")) {
+                expire_ms = std.fmt.parseInt(u32, cmd.args[4], 10) catch {
+                    return resp.writeError("ERR invalid expire time in 'set' command");
+                };
+            } else {
+                return resp.writeError("ERR syntax error");
+            }
+        } else if (cmd.args.len == 4) {
+            return resp.writeError("ERR syntax error");
+        }
+
+        try self.store.set(self.runtime, cmd.args[1], cmd.args[2], expire_ms);
         try resp.writeSimpleString("OK");
     }
 
@@ -360,8 +568,8 @@ const CommandHandler = struct {
         if (cmd.args.len != 2) {
             return resp.writeError("ERR wrong number of arguments for 'get' command");
         }
-        if (self.store.get(cmd.args[1])) |value_data| {
-            defer self.store.releaseValue(value_data);
+        if (self.store.get(self.runtime, cmd.args[1])) |value_data| {
+            defer self.store.releaseValue(self.runtime, value_data);
             try resp.writeBulkString(value_data);
         } else {
             try resp.writeNull();
@@ -372,7 +580,7 @@ const CommandHandler = struct {
         if (cmd.args.len != 2) {
             return resp.writeError("ERR wrong number of arguments for 'del' command");
         }
-        const deleted = self.store.del(cmd.args[1]);
+        const deleted = self.store.del(self.runtime, cmd.args[1]);
         try resp.writeInteger(if (deleted) 1 else 0);
     }
 
@@ -380,7 +588,7 @@ const CommandHandler = struct {
         if (cmd.args.len != 2) {
             return resp.writeError("ERR wrong number of arguments for 'exists' command");
         }
-        const exists_result = self.store.exists(cmd.args[1]);
+        const exists_result = self.store.exists(self.runtime, cmd.args[1]);
         try resp.writeInteger(if (exists_result) 1 else 0);
     }
 };
@@ -392,6 +600,7 @@ const CommandHandler = struct {
 const ConnectionHandler = struct {
     stream: zio.TcpStream,
     store: *Store,
+    runtime: *zio.Runtime,
     allocator: std.mem.Allocator,
 
     fn run(rt: *zio.Runtime, stream: zio.TcpStream, store_ptr: *Store, alloc: std.mem.Allocator, semaphore: *zio.Semaphore) !void {
@@ -400,6 +609,7 @@ const ConnectionHandler = struct {
         var self = ConnectionHandler{
             .stream = stream,
             .store = store_ptr,
+            .runtime = rt,
             .allocator = alloc,
         };
         defer self.stream.close();
@@ -425,7 +635,7 @@ const ConnectionHandler = struct {
         };
 
         var resp_writer = RespWriter{ .writer = &writer.interface };
-        var handler = CommandHandler{ .store = self.store };
+        var handler = CommandHandler{ .store = self.store, .runtime = self.runtime };
 
         while (true) {
             var cmd = parser.parseCommand() catch |err| {
@@ -471,6 +681,17 @@ fn runServer(rt: *zio.Runtime, store_ptr: *Store, alloc: std.mem.Allocator) !voi
 
     try listener.bind(addr);
     try listener.listen(128);
+
+    // Spawn background expiration worker
+    var expiration_task = try rt.spawn(expirationWorker, .{ rt, store_ptr }, .{});
+    defer {
+        // Signal shutdown to expiration worker
+        store_ptr.mutex.lock(rt);
+        store_ptr.shutdown = true;
+        store_ptr.expiration_cond.signal(rt);
+        store_ptr.mutex.unlock(rt);
+        expiration_task.deinit();
+    }
 
     // Initialize semaphore with MAX_CONNECTIONS permits
     var connection_limiter = zio.Semaphore{ .permits = MAX_CONNECTIONS };
