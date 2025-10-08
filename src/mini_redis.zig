@@ -35,6 +35,9 @@ const MAX_ARRAY_LEN = 128; // max command args
 const READ_BUFFER_SIZE = 64 * 1024; // 64KB for reading commands
 const WRITE_BUFFER_SIZE = 16 * 1024; // 16KB for writing responses
 
+// Connection limits
+const MAX_CONNECTIONS: usize = 100; // Maximum concurrent connections
+
 // =============================================================================
 // StringRef - Reference-counted string with single allocation
 // =============================================================================
@@ -391,8 +394,9 @@ const ConnectionHandler = struct {
     store: *Store,
     allocator: std.mem.Allocator,
 
-    fn run(rt: *zio.Runtime, stream: zio.TcpStream, store_ptr: *Store, alloc: std.mem.Allocator) !void {
-        _ = rt;
+    fn run(rt: *zio.Runtime, stream: zio.TcpStream, store_ptr: *Store, alloc: std.mem.Allocator, semaphore: *zio.Semaphore) !void {
+        defer semaphore.post(rt);
+
         var self = ConnectionHandler{
             .stream = stream,
             .store = store_ptr,
@@ -468,13 +472,23 @@ fn runServer(rt: *zio.Runtime, store_ptr: *Store, alloc: std.mem.Allocator) !voi
     try listener.bind(addr);
     try listener.listen(128);
 
-    std.log.info("Mini-Redis server listening on 127.0.0.1:6379", .{});
+    // Initialize semaphore with MAX_CONNECTIONS permits
+    var connection_limiter = zio.Semaphore{ .permits = MAX_CONNECTIONS };
+
+    std.log.info("Mini-Redis server listening on 127.0.0.1:6379 (max {d} connections)", .{MAX_CONNECTIONS});
     std.log.info("Test with: redis-cli -p 6379", .{});
 
     while (true) {
+        // Wait for a permit to become available
+        //
+        // If none are available, the listener waits for one.
+        // When handlers complete processing a connection, the permit is returned
+        // to the semaphore.
+        connection_limiter.wait(rt);
+
         var stream = try listener.accept();
         errdefer stream.close();
-        var handle = try rt.spawn(ConnectionHandler.run, .{ rt, stream, store_ptr, alloc }, .{});
+        var handle = try rt.spawn(ConnectionHandler.run, .{ rt, stream, store_ptr, alloc, &connection_limiter }, .{});
         handle.deinit();
     }
 }
