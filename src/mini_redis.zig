@@ -202,12 +202,12 @@ const Store = struct {
         const gop = try self.map.getOrPut(self.allocator, key);
         errdefer if (!gop.found_existing) self.map.removeByPtr(gop.key_ptr);
 
-        var allocated_key: []const u8 = undefined;
-        errdefer if (!gop.found_existing) self.allocator.free(key);
+        var allocated_key: ?[]const u8 = null;
+        errdefer if (allocated_key) |k| self.allocator.free(k);
 
         if (!gop.found_existing) {
             allocated_key = try self.allocator.dupe(u8, key);
-            gop.key_ptr.* = allocated_key;
+            gop.key_ptr.* = allocated_key.?; 
         }
 
         var should_remove_expiration = true;
