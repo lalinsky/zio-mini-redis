@@ -706,10 +706,13 @@ fn runServer(rt: *zio.Runtime, store_ptr: *Store, alloc: std.mem.Allocator) !voi
         // When handlers complete processing a connection, the permit is returned
         // to the semaphore.
         connection_limiter.wait(rt);
+        var permit_released = false;
+        errdefer if (!permit_released) connection_limiter.post();
 
         var stream = try listener.accept();
         errdefer stream.close();
         var handle = try rt.spawn(ConnectionHandler.run, .{ rt, stream, store_ptr, alloc, &connection_limiter }, .{});
+        permit_released = true;
         handle.deinit();
     }
 }
