@@ -10,6 +10,13 @@
 //! - GET <key>: Retrieves a value by key
 //! - DEL <key>: Deletes a key
 //! - EXISTS <key>: Checks if a key exists
+//! - TTL <key>: Get remaining time to live in seconds
+//! - PTTL <key>: Get remaining time to live in milliseconds
+//! - EXPIRE <key> <seconds>: Set expiration on an existing key
+//! - PEXPIRE <key> <milliseconds>: Set expiration on an existing key in milliseconds
+//! - PERSIST <key>: Remove expiration from a key
+//! - SETEX <key> <seconds> <value>: Set key with expiration in seconds
+//! - PSETEX <key> <milliseconds> <value>: Set key with expiration in milliseconds
 //!
 //! Usage:
 //!   zig build
@@ -207,9 +214,9 @@ const Store = struct {
         const value_ref = try StringRef.create(self.allocator, value);
         errdefer value_ref.release(self.allocator);
 
-        // Calculate expiration time (u32 * 1,000,000 fits in i64)
+        // Calculate expiration time
         const expires_at_ns: ?i64 = if (expire_ms) |ms|
-            @intCast(std.time.nanoTimestamp() + ms * 1_000_000)
+            @intCast(std.time.nanoTimestamp() + @as(i64, ms) * 1_000_000)
         else
             null;
 
@@ -299,6 +306,76 @@ const Store = struct {
         defer self.mutex.unlock(rt);
 
         return self.getEntry(key) != null;
+    }
+
+    /// Get TTL for a key in nanoseconds
+    /// Returns: nanoseconds remaining, -1 if no expiration, -2 if key doesn't exist
+    fn getTtl(self: *Store, rt: *zio.Runtime, key: []const u8) i64 {
+        self.mutex.lock(rt);
+        defer self.mutex.unlock(rt);
+
+        const entry = self.getEntry(key) orelse return -2;
+
+        if (entry.value_ptr.expires_at_ns) |expires_at| {
+            const now = std.time.nanoTimestamp();
+            const remaining: i64 = @intCast(expires_at - now);
+            return if (remaining > 0) remaining else -2; // Already expired
+        }
+
+        return -1; // No expiration
+    }
+
+    /// Set expiration on an existing key
+    /// Returns true if expiration was set, false if key doesn't exist
+    fn expire(self: *Store, rt: *zio.Runtime, key: []const u8, expire_ms: u32) !bool {
+        self.mutex.lock(rt);
+        defer self.mutex.unlock(rt);
+
+        const entry = self.getEntry(key) orelse return false;
+
+        const expires_at_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i64, expire_ms) * 1_000_000);
+
+        // Remove old expiration if it exists
+        if (entry.value_ptr.expires_at_ns) |old_when_ns| {
+            // Only remove if different
+            if (old_when_ns != expires_at_ns) {
+                self.removeExpiration(.{ .when_ns = old_when_ns, .key = entry.key_ptr.* });
+            } else {
+                // Same expiration time, no need to update
+                return true;
+            }
+        }
+
+        // Add new expiration
+        try self.expirations.add(.{
+            .when_ns = expires_at_ns,
+            .key = entry.key_ptr.*,
+        });
+
+        // Update entry
+        entry.value_ptr.expires_at_ns = expires_at_ns;
+
+        // Wake up expiration worker
+        self.expiration_cond.signal(rt);
+
+        return true;
+    }
+
+    /// Remove expiration from a key
+    /// Returns true if expiration was removed, false if key doesn't exist or had no expiration
+    fn persist(self: *Store, rt: *zio.Runtime, key: []const u8) bool {
+        self.mutex.lock(rt);
+        defer self.mutex.unlock(rt);
+
+        const entry = self.getEntry(key) orelse return false;
+
+        if (entry.value_ptr.expires_at_ns) |expires_at| {
+            self.removeExpiration(.{ .when_ns = expires_at, .key = entry.key_ptr.* });
+            entry.value_ptr.expires_at_ns = null;
+            return true;
+        }
+
+        return false; // No expiration to remove
     }
 
     fn removeEntry(self: *Store, entry: std.StringHashMapUnmanaged(Entry).Entry) void {
@@ -505,6 +582,20 @@ const CommandHandler = struct {
             return self.handleDel(cmd, resp);
         } else if (std.mem.eql(u8, upper_cmd, "EXISTS")) {
             return self.handleExists(cmd, resp);
+        } else if (std.mem.eql(u8, upper_cmd, "TTL")) {
+            return self.handleTtl(cmd, resp);
+        } else if (std.mem.eql(u8, upper_cmd, "PTTL")) {
+            return self.handlePttl(cmd, resp);
+        } else if (std.mem.eql(u8, upper_cmd, "EXPIRE")) {
+            return self.handleExpire(cmd, resp);
+        } else if (std.mem.eql(u8, upper_cmd, "PEXPIRE")) {
+            return self.handlePexpire(cmd, resp);
+        } else if (std.mem.eql(u8, upper_cmd, "PERSIST")) {
+            return self.handlePersist(cmd, resp);
+        } else if (std.mem.eql(u8, upper_cmd, "SETEX")) {
+            return self.handleSetex(cmd, resp);
+        } else if (std.mem.eql(u8, upper_cmd, "PSETEX")) {
+            return self.handlePsetex(cmd, resp);
         } else {
             try resp.writeError("ERR unknown command");
         }
@@ -582,6 +673,88 @@ const CommandHandler = struct {
         }
         const exists_result = self.store.exists(self.runtime, cmd.args[1]);
         try resp.writeInteger(if (exists_result) 1 else 0);
+    }
+
+    fn handleTtl(self: *CommandHandler, cmd: *Command, resp: *RespWriter) !void {
+        if (cmd.args.len != 2) {
+            return resp.writeError("ERR wrong number of arguments for 'ttl' command");
+        }
+        const ttl_ns = self.store.getTtl(self.runtime, cmd.args[1]);
+        if (ttl_ns == -2 or ttl_ns == -1) {
+            try resp.writeInteger(ttl_ns);
+        } else {
+            // Convert nanoseconds to seconds
+            const ttl_s: i64 = @intCast(@divFloor(ttl_ns, 1_000_000_000));
+            try resp.writeInteger(ttl_s);
+        }
+    }
+
+    fn handlePttl(self: *CommandHandler, cmd: *Command, resp: *RespWriter) !void {
+        if (cmd.args.len != 2) {
+            return resp.writeError("ERR wrong number of arguments for 'pttl' command");
+        }
+        const ttl_ns = self.store.getTtl(self.runtime, cmd.args[1]);
+        if (ttl_ns == -2 or ttl_ns == -1) {
+            try resp.writeInteger(ttl_ns);
+        } else {
+            // Convert nanoseconds to milliseconds
+            const ttl_ms: i64 = @intCast(@divFloor(ttl_ns, 1_000_000));
+            try resp.writeInteger(ttl_ms);
+        }
+    }
+
+    fn handleExpire(self: *CommandHandler, cmd: *Command, resp: *RespWriter) !void {
+        if (cmd.args.len != 3) {
+            return resp.writeError("ERR wrong number of arguments for 'expire' command");
+        }
+        const seconds = std.fmt.parseInt(u32, cmd.args[2], 10) catch {
+            return resp.writeError("ERR value is not an integer or out of range");
+        };
+        const expire_ms = seconds * 1000;
+        const success = try self.store.expire(self.runtime, cmd.args[1], expire_ms);
+        try resp.writeInteger(if (success) 1 else 0);
+    }
+
+    fn handlePexpire(self: *CommandHandler, cmd: *Command, resp: *RespWriter) !void {
+        if (cmd.args.len != 3) {
+            return resp.writeError("ERR wrong number of arguments for 'pexpire' command");
+        }
+        const milliseconds = std.fmt.parseInt(u32, cmd.args[2], 10) catch {
+            return resp.writeError("ERR value is not an integer or out of range");
+        };
+        const success = try self.store.expire(self.runtime, cmd.args[1], milliseconds);
+        try resp.writeInteger(if (success) 1 else 0);
+    }
+
+    fn handlePersist(self: *CommandHandler, cmd: *Command, resp: *RespWriter) !void {
+        if (cmd.args.len != 2) {
+            return resp.writeError("ERR wrong number of arguments for 'persist' command");
+        }
+        const success = self.store.persist(self.runtime, cmd.args[1]);
+        try resp.writeInteger(if (success) 1 else 0);
+    }
+
+    fn handleSetex(self: *CommandHandler, cmd: *Command, resp: *RespWriter) !void {
+        if (cmd.args.len != 4) {
+            return resp.writeError("ERR wrong number of arguments for 'setex' command");
+        }
+        const seconds = std.fmt.parseInt(u32, cmd.args[2], 10) catch {
+            return resp.writeError("ERR value is not an integer or out of range");
+        };
+        const expire_ms = seconds * 1000;
+        try self.store.set(self.runtime, cmd.args[1], cmd.args[3], expire_ms);
+        try resp.writeSimpleString("OK");
+    }
+
+    fn handlePsetex(self: *CommandHandler, cmd: *Command, resp: *RespWriter) !void {
+        if (cmd.args.len != 4) {
+            return resp.writeError("ERR wrong number of arguments for 'psetex' command");
+        }
+        const milliseconds = std.fmt.parseInt(u32, cmd.args[2], 10) catch {
+            return resp.writeError("ERR value is not an integer or out of range");
+        };
+        try self.store.set(self.runtime, cmd.args[1], cmd.args[3], milliseconds);
+        try resp.writeSimpleString("OK");
     }
 };
 

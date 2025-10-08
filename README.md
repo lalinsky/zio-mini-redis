@@ -8,10 +8,17 @@ Implements a subset of the Redis RESP2 (REdis Serialization Protocol) with the f
 
 - `PING` - Returns PONG
 - `ECHO <message>` - Returns the message
-- `SET <key> <value>` - Stores a key-value pair
+- `SET <key> <value> [EX seconds|PX milliseconds]` - Stores a key-value pair with optional expiration
 - `GET <key>` - Retrieves a value by key
 - `DEL <key>` - Deletes a key
 - `EXISTS <key>` - Checks if a key exists
+- `TTL <key>` - Get remaining time to live in seconds (-1 if no expiration, -2 if key doesn't exist)
+- `PTTL <key>` - Get remaining time to live in milliseconds (-1 if no expiration, -2 if key doesn't exist)
+- `EXPIRE <key> <seconds>` - Set expiration on an existing key
+- `PEXPIRE <key> <milliseconds>` - Set expiration on an existing key in milliseconds
+- `PERSIST <key>` - Remove expiration from a key
+- `SETEX <key> <seconds> <value>` - Set key with expiration in seconds
+- `PSETEX <key> <milliseconds> <value>` - Set key with expiration in milliseconds
 
 ## Requirements
 
