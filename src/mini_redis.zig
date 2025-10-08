@@ -202,6 +202,27 @@ const Store = struct {
         const gop = try self.map.getOrPut(self.allocator, key);
         errdefer if (!gop.found_existing) self.map.removeByPtr(gop.key_ptr);
 
+        // If expiration is needed, allocate key (if new) and add to queue first
+        if (expires_at_ns) |when_ns| {
+            if (!gop.found_existing) {
+                // Allocate key for new entry
+                gop.key_ptr.* = try self.allocator.dupe(u8, key);
+                errdefer self.allocator.free(gop.key_ptr.*);
+            }
+
+            // Try to add to expiration queue before modifying anything else
+            try self.expirations.add(.{
+                .when_ns = when_ns,
+                .key = gop.key_ptr.*,
+            });
+        } else {
+            // No expiration, just allocate key if needed
+            if (!gop.found_existing) {
+                gop.key_ptr.* = try self.allocator.dupe(u8, key);
+            }
+        }
+
+        // Only now modify map entry
         if (gop.found_existing) {
             // Remove old expiration entry if it exists
             if (gop.value_ptr.*.expires_at_ns) |old_when_ns| {
@@ -209,9 +230,6 @@ const Store = struct {
             }
             // Release old value
             gop.value_ptr.*.value_ref.release(self.allocator);
-        } else {
-            // Allocate owned key for new entry
-            gop.key_ptr.* = try self.allocator.dupe(u8, key);
         }
 
         // Set new value
@@ -220,21 +238,13 @@ const Store = struct {
             .expires_at_ns = expires_at_ns,
         };
 
-        // Track expiration if specified
+        // Wake up expiration worker if this expires sooner
         if (expires_at_ns) |when_ns| {
-            // Check if this is the soonest expiration
             const should_notify = if (self.expirations.peek()) |next|
                 when_ns < next.when_ns
             else
                 true;
 
-            // Use reference to key in map (not owned copy)
-            try self.expirations.add(.{
-                .when_ns = when_ns,
-                .key = gop.key_ptr.*,
-            });
-
-            // Wake up expiration worker if this expires sooner
             if (should_notify) {
                 self.expiration_cond.signal(rt);
             }
