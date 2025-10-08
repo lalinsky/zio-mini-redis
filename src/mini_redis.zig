@@ -184,6 +184,21 @@ const Store = struct {
         }
     }
 
+    /// Get an entry from the map, handling lazy expiration automatically
+    fn getEntry(self: *Store, key: []const u8) ?std.StringHashMapUnmanaged(Entry).Entry {
+        const entry = self.map.getEntry(key) orelse return null;
+
+        // Check if expired (lazy expiration)
+        if (entry.value_ptr.*.expires_at_ns) |expires_at| {
+            if (std.time.nanoTimestamp() >= expires_at) {
+                self.removeEntry(entry);
+                return null;
+            }
+        }
+
+        return entry;
+    }
+
     fn set(self: *Store, rt: *zio.Runtime, key: []const u8, value: []const u8, expire_ms: ?u32) !void {
         self.mutex.lock(rt);
         defer self.mutex.unlock(rt);
@@ -255,22 +270,10 @@ const Store = struct {
         self.mutex.lock(rt);
         defer self.mutex.unlock(rt);
 
-        const gop = self.map.getEntry(key) orelse return null;
+        const entry = self.getEntry(key) orelse return null;
 
-        // Check if expired (lazy expiration)
-        if (gop.value_ptr.*.expires_at_ns) |expires_at| {
-            if (std.time.nanoTimestamp() >= expires_at) {
-                // Expired - remove from expiration queue and map
-                self.removeExpiration(.{ .when_ns = expires_at, .key = gop.key_ptr.* });
-                gop.value_ptr.*.value_ref.release(self.allocator);
-                self.allocator.free(gop.key_ptr.*);
-                self.map.removeByPtr(gop.key_ptr);
-                return null;
-            }
-        }
-
-        gop.value_ptr.*.value_ref.borrow();
-        return gop.value_ptr.*.value_ref.getData();
+        entry.value_ptr.*.value_ref.borrow();
+        return entry.value_ptr.*.value_ref.getData();
     }
 
     fn releaseValue(self: *Store, rt: *zio.Runtime, value_data: []const u8) void {
@@ -285,25 +288,9 @@ const Store = struct {
         self.mutex.lock(rt);
         defer self.mutex.unlock(rt);
 
-        const gop = self.map.getEntry(key) orelse return false;
+        const entry = self.getEntry(key) orelse return false;
 
-        // Check if expired (lazy expiration)
-        if (gop.value_ptr.*.expires_at_ns) |expires_at| {
-            if (std.time.nanoTimestamp() >= expires_at) {
-                // Expired - remove from expiration queue and map, but return false
-                self.removeExpiration(.{ .when_ns = expires_at, .key = gop.key_ptr.* });
-                gop.value_ptr.*.value_ref.release(self.allocator);
-                self.allocator.free(gop.key_ptr.*);
-                self.map.removeByPtr(gop.key_ptr);
-                return false;
-            }
-        }
-
-        // Key exists and is not expired - delete it
-        self.removeExpiration(.{ .when_ns = gop.value_ptr.*.expires_at_ns orelse 0, .key = gop.key_ptr.* });
-        gop.value_ptr.*.value_ref.release(self.allocator);
-        self.allocator.free(gop.key_ptr.*);
-        self.map.removeByPtr(gop.key_ptr);
+        self.removeEntry(entry);
         return true;
     }
 
@@ -311,21 +298,16 @@ const Store = struct {
         self.mutex.lock(rt);
         defer self.mutex.unlock(rt);
 
-        const gop = self.map.getEntry(key) orelse return false;
+        return self.getEntry(key) != null;
+    }
 
-        // Check if expired (lazy expiration)
-        if (gop.value_ptr.*.expires_at_ns) |expires_at| {
-            if (std.time.nanoTimestamp() >= expires_at) {
-                // Expired - remove from expiration queue and map
-                self.removeExpiration(.{ .when_ns = expires_at, .key = gop.key_ptr.* });
-                gop.value_ptr.*.value_ref.release(self.allocator);
-                self.allocator.free(gop.key_ptr.*);
-                self.map.removeByPtr(gop.key_ptr);
-                return false;
-            }
+    fn removeEntry(self: *Store, entry: std.StringHashMapUnmanaged(Entry).Entry) void {
+        if (entry.value_ptr.expires_at_ns) |expires_at| {
+            self.removeExpiration(.{ .when_ns = expires_at, .key = entry.key_ptr.* });
         }
-
-        return true;
+        entry.value_ptr.value_ref.release(self.allocator);
+        self.allocator.free(entry.key_ptr.*);
+        self.map.removeByPtr(entry.key_ptr);
     }
 };
 
