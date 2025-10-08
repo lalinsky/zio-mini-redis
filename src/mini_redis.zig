@@ -193,8 +193,8 @@ const Store = struct {
         errdefer value_ref.release(self.allocator);
 
         // Calculate expiration time (u32 * 1,000,000 fits in i64)
-        const expires_at_ns = if (expire_ms) |ms|
-            std.time.nanoTimestamp() + @as(i64, ms) * 1_000_000
+        const expires_at_ns: ?i64 = if (expire_ms) |ms|
+            @intCast(std.time.nanoTimestamp() + ms * 1_000_000)
         else
             null;
 
@@ -202,31 +202,43 @@ const Store = struct {
         const gop = try self.map.getOrPut(self.allocator, key);
         errdefer if (!gop.found_existing) self.map.removeByPtr(gop.key_ptr);
 
-        // If expiration is needed, allocate key (if new) and add to queue first
-        if (expires_at_ns) |when_ns| {
-            if (!gop.found_existing) {
-                // Allocate key for new entry
-                gop.key_ptr.* = try self.allocator.dupe(u8, key);
-                errdefer self.allocator.free(gop.key_ptr.*);
-            }
+        var allocated_key: []const u8 = undefined;
+        errdefer if (!gop.found_existing) self.allocator.free(key);
 
-            // Try to add to expiration queue before modifying anything else
-            try self.expirations.add(.{
-                .when_ns = when_ns,
-                .key = gop.key_ptr.*,
-            });
-        } else {
-            // No expiration, just allocate key if needed
-            if (!gop.found_existing) {
-                gop.key_ptr.* = try self.allocator.dupe(u8, key);
+        if (!gop.found_existing) {
+            allocated_key = try self.allocator.dupe(u8, key);
+            gop.key_ptr.* = allocated_key;
+        }
+
+        var should_remove_expiration = true;
+        if (expires_at_ns) |when_ns| {
+            var should_add = true;
+            if (gop.found_existing) {
+                if (gop.value_ptr.*.expires_at_ns) |old_when_ns| {
+                    if (when_ns == old_when_ns) {
+                        // If new expiration is same, we don't need to add
+                        should_add = false;
+                        should_remove_expiration = false;
+                    }
+                }
+            }
+            if (should_add) {
+                // Add to expiration queue
+                try self.expirations.add(.{
+                    .when_ns = when_ns,
+                    .key = gop.key_ptr.*,
+                });
+                // Wake up expiration worker, it needs to update its sleep time
+                self.expiration_cond.signal(rt);
             }
         }
 
-        // Only now modify map entry
         if (gop.found_existing) {
             // Remove old expiration entry if it exists
             if (gop.value_ptr.*.expires_at_ns) |old_when_ns| {
-                self.removeExpiration(.{ .when_ns = old_when_ns, .key = gop.key_ptr.* });
+                if (should_remove_expiration) {
+                    self.removeExpiration(.{ .when_ns = old_when_ns, .key = gop.key_ptr.*, });
+                }
             }
             // Release old value
             gop.value_ptr.*.value_ref.release(self.allocator);
@@ -237,18 +249,6 @@ const Store = struct {
             .value_ref = value_ref,
             .expires_at_ns = expires_at_ns,
         };
-
-        // Wake up expiration worker if this expires sooner
-        if (expires_at_ns) |when_ns| {
-            const should_notify = if (self.expirations.peek()) |next|
-                when_ns < next.when_ns
-            else
-                true;
-
-            if (should_notify) {
-                self.expiration_cond.signal(rt);
-            }
-        }
     }
 
     fn get(self: *Store, rt: *zio.Runtime, key: []const u8) ?[]const u8 {
@@ -717,7 +717,7 @@ fn runServer(rt: *zio.Runtime, store_ptr: *Store, alloc: std.mem.Allocator) !voi
         // to the semaphore.
         connection_limiter.wait(rt);
         var permit_released = false;
-        errdefer if (!permit_released) connection_limiter.post();
+        errdefer if (!permit_released) connection_limiter.post(rt);
 
         var stream = try listener.accept();
         errdefer stream.close();
