@@ -207,7 +207,7 @@ const Store = struct {
     }
 
     fn set(self: *Store, rt: *zio.Runtime, key: []const u8, value: []const u8, expire_ms: ?u32) !void {
-        self.mutex.lock(rt);
+        try self.mutex.lock(rt);
         defer self.mutex.unlock(rt);
 
         // Create new StringRef
@@ -273,8 +273,8 @@ const Store = struct {
         };
     }
 
-    fn get(self: *Store, rt: *zio.Runtime, key: []const u8) ?[]const u8 {
-        self.mutex.lock(rt);
+    fn get(self: *Store, rt: *zio.Runtime, key: []const u8) !?[]const u8 {
+        try self.mutex.lock(rt);
         defer self.mutex.unlock(rt);
 
         const entry = self.getEntry(key) orelse return null;
@@ -284,15 +284,18 @@ const Store = struct {
     }
 
     fn releaseValue(self: *Store, rt: *zio.Runtime, value_data: []const u8) void {
-        self.mutex.lock(rt);
+        rt.beginShield();
+        defer rt.endShield();
+
+        self.mutex.lock(rt) catch unreachable;
         defer self.mutex.unlock(rt);
 
         const ref = StringRef.fromData(value_data);
         ref.release(self.allocator);
     }
 
-    fn del(self: *Store, rt: *zio.Runtime, key: []const u8) bool {
-        self.mutex.lock(rt);
+    fn del(self: *Store, rt: *zio.Runtime, key: []const u8) !bool {
+        try self.mutex.lock(rt);
         defer self.mutex.unlock(rt);
 
         const entry = self.getEntry(key) orelse return false;
@@ -301,8 +304,8 @@ const Store = struct {
         return true;
     }
 
-    fn exists(self: *Store, rt: *zio.Runtime, key: []const u8) bool {
-        self.mutex.lock(rt);
+    fn exists(self: *Store, rt: *zio.Runtime, key: []const u8) !bool {
+        try self.mutex.lock(rt);
         defer self.mutex.unlock(rt);
 
         return self.getEntry(key) != null;
@@ -310,8 +313,8 @@ const Store = struct {
 
     /// Get TTL for a key in nanoseconds
     /// Returns: nanoseconds remaining, -1 if no expiration, -2 if key doesn't exist
-    fn getTtl(self: *Store, rt: *zio.Runtime, key: []const u8) i64 {
-        self.mutex.lock(rt);
+    fn getTtl(self: *Store, rt: *zio.Runtime, key: []const u8) !i64 {
+        try self.mutex.lock(rt);
         defer self.mutex.unlock(rt);
 
         const entry = self.getEntry(key) orelse return -2;
@@ -328,7 +331,7 @@ const Store = struct {
     /// Set expiration on an existing key
     /// Returns true if expiration was set, false if key doesn't exist
     fn expire(self: *Store, rt: *zio.Runtime, key: []const u8, expire_ms: u32) !bool {
-        self.mutex.lock(rt);
+        try self.mutex.lock(rt);
         defer self.mutex.unlock(rt);
 
         const entry = self.getEntry(key) orelse return false;
@@ -363,8 +366,8 @@ const Store = struct {
 
     /// Remove expiration from a key
     /// Returns true if expiration was removed, false if key doesn't exist or had no expiration
-    fn persist(self: *Store, rt: *zio.Runtime, key: []const u8) bool {
-        self.mutex.lock(rt);
+    fn persist(self: *Store, rt: *zio.Runtime, key: []const u8) !bool {
+        try self.mutex.lock(rt);
         defer self.mutex.unlock(rt);
 
         const entry = self.getEntry(key) orelse return false;
@@ -393,9 +396,9 @@ const Store = struct {
 // =============================================================================
 
 /// Background task that purges expired keys
-fn expirationWorker(rt: *zio.Runtime, store: *Store) void {
+fn expirationWorker(rt: *zio.Runtime, store: *Store) !void {
     while (true) {
-        store.mutex.lock(rt);
+        try store.mutex.lock(rt);
         defer store.mutex.unlock(rt);
 
         if (store.shutdown) {
@@ -430,7 +433,7 @@ fn expirationWorker(rt: *zio.Runtime, store: *Store) void {
         } else {
             // No expirations - wait indefinitely for notification
             // NOTE: wait releases and reacquires mutex internally
-            store.expiration_cond.wait(rt, &store.mutex);
+            try store.expiration_cond.wait(rt, &store.mutex);
         }
     }
 
@@ -651,7 +654,7 @@ const CommandHandler = struct {
         if (cmd.args.len != 2) {
             return resp.writeError("ERR wrong number of arguments for 'get' command");
         }
-        if (self.store.get(self.runtime, cmd.args[1])) |value_data| {
+        if (try self.store.get(self.runtime, cmd.args[1])) |value_data| {
             defer self.store.releaseValue(self.runtime, value_data);
             try resp.writeBulkString(value_data);
         } else {
@@ -663,7 +666,7 @@ const CommandHandler = struct {
         if (cmd.args.len != 2) {
             return resp.writeError("ERR wrong number of arguments for 'del' command");
         }
-        const deleted = self.store.del(self.runtime, cmd.args[1]);
+        const deleted = try self.store.del(self.runtime, cmd.args[1]);
         try resp.writeInteger(if (deleted) 1 else 0);
     }
 
@@ -671,7 +674,7 @@ const CommandHandler = struct {
         if (cmd.args.len != 2) {
             return resp.writeError("ERR wrong number of arguments for 'exists' command");
         }
-        const exists_result = self.store.exists(self.runtime, cmd.args[1]);
+        const exists_result = try self.store.exists(self.runtime, cmd.args[1]);
         try resp.writeInteger(if (exists_result) 1 else 0);
     }
 
@@ -679,7 +682,7 @@ const CommandHandler = struct {
         if (cmd.args.len != 2) {
             return resp.writeError("ERR wrong number of arguments for 'ttl' command");
         }
-        const ttl_ns = self.store.getTtl(self.runtime, cmd.args[1]);
+        const ttl_ns = try self.store.getTtl(self.runtime, cmd.args[1]);
         if (ttl_ns == -2 or ttl_ns == -1) {
             try resp.writeInteger(ttl_ns);
         } else {
@@ -693,7 +696,7 @@ const CommandHandler = struct {
         if (cmd.args.len != 2) {
             return resp.writeError("ERR wrong number of arguments for 'pttl' command");
         }
-        const ttl_ns = self.store.getTtl(self.runtime, cmd.args[1]);
+        const ttl_ns = try self.store.getTtl(self.runtime, cmd.args[1]);
         if (ttl_ns == -2 or ttl_ns == -1) {
             try resp.writeInteger(ttl_ns);
         } else {
@@ -730,7 +733,7 @@ const CommandHandler = struct {
         if (cmd.args.len != 2) {
             return resp.writeError("ERR wrong number of arguments for 'persist' command");
         }
-        const success = self.store.persist(self.runtime, cmd.args[1]);
+        const success = try self.store.persist(self.runtime, cmd.args[1]);
         try resp.writeInteger(if (success) 1 else 0);
     }
 
@@ -851,10 +854,12 @@ fn runServer(rt: *zio.Runtime, store_ptr: *Store, alloc: std.mem.Allocator) !voi
     var expiration_task = try rt.spawn(expirationWorker, .{ rt, store_ptr }, .{});
     defer {
         // Signal shutdown to expiration worker
-        store_ptr.mutex.lock(rt);
+        rt.beginShield();
+        store_ptr.mutex.lock(rt) catch unreachable;
         store_ptr.shutdown = true;
         store_ptr.expiration_cond.signal(rt);
         store_ptr.mutex.unlock(rt);
+        rt.endShield();
         expiration_task.deinit();
     }
 
@@ -870,7 +875,7 @@ fn runServer(rt: *zio.Runtime, store_ptr: *Store, alloc: std.mem.Allocator) !voi
         // If none are available, the listener waits for one.
         // When handlers complete processing a connection, the permit is returned
         // to the semaphore.
-        connection_limiter.wait(rt);
+        try connection_limiter.wait(rt);
         var permit_released = false;
         errdefer if (!permit_released) connection_limiter.post(rt);
 
